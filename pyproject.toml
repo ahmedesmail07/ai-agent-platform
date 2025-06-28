@@ -1,0 +1,12 @@
+[tool.flake8]
+max-line-length = 99
+exclude = ".git,__pycache__,venv,.venv,env,.env"
+ignore = ["E203", "W503"]
+
+[tool.black]
+line-length = 99
+target_version = ["py38", "py39", "py310", "py311"]
+
+[tool.isort]
+line_length = 99
+profile = "black" 
