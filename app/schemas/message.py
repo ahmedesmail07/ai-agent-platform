@@ -60,3 +60,7 @@ class AgentResponse(BaseModel):
 
     message: str
     session_id: int
+
+
+class UserMessageWithKnowledgeBase(UserMessageCreate):
+    knowledge_base: Optional[str] = None  # New optional field

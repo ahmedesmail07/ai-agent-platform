@@ -4,6 +4,8 @@ from typing import Dict, List, Optional, Sequence
 import openai
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
 
 from app.exceptions import (
     SessionNotFoundError,
@@ -93,12 +95,19 @@ class SessionService:
         await self.get_session(db, session_id)
 
         result = await db.execute(
-            select(Message).where(Message.session_id == session_id).order_by(Message.created_at)
+            select(Message)
+            .options(selectinload(Message.audio_metadata))
+            .where(Message.session_id == session_id)
+            .order_by(Message.created_at)
         )
         return result.scalars().all()
 
     async def send_user_message_and_get_response(
-        self, db: AsyncSession, session_id: int, user_message: str
+        self,
+        db: AsyncSession,
+        session_id: int,
+        user_message: str,
+        knowledge_base: Optional[str] = None,
     ) -> tuple[Message, Message]:
         """Send user message and get AI response"""
         session = await self.get_session(db, session_id)
@@ -108,19 +117,29 @@ class SessionService:
 
         user_msg = await self.add_message(db, session_id, "user", user_message)
 
-        ai_response = await self._get_ai_response(db, session_id, user_message, agent)
+        ai_response = await self._get_ai_response(
+            db, session_id, user_message, agent, knowledge_base
+        )
 
         ai_msg = await self.add_message(db, session_id, "agent", ai_response)
 
         return user_msg, ai_msg
 
     async def _get_ai_response(
-        self, db: AsyncSession, session_id: int, user_message: str, agent: Agent
+        self,
+        db: AsyncSession,
+        session_id: int,
+        user_message: str,
+        agent: Agent,
+        knowledge_base: Optional[str] = None,
     ) -> str:
         """Get AI response using OpenAI API"""
         messages = await self.get_session_messages(db, session_id)
         conversation: List[Dict[str, str]] = []
         system_prompt = agent.configuration.get("system_prompt", "") if agent.configuration else ""
+        knowledge_base = (
+            agent.configuration.get("knowledge_base", "") if agent.configuration else ""
+        )
         if system_prompt:
             conversation.append({"role": "system", "content": system_prompt})
 
@@ -130,6 +149,14 @@ class SessionService:
             conversation.append({"role": role, "content": msg_content})
 
         conversation.append({"role": "user", "content": user_message})
+        if knowledge_base:
+            conversation.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": f"This is important knowledge base context: {knowledge_base}",
+                },
+            )
 
         try:
             client = self.openai_client or openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -157,7 +184,11 @@ class SessionService:
 
             content: Optional[str] = response.choices[0].message.content
             if content is None:
-                return "No response generated"
+                raise OpenAIChatCompletionError(
+                    message="No response generated",
+                    model=model,
+                    messages_count=len(conversation),
+                )
             return content
 
         except openai.AuthenticationError:
@@ -173,4 +204,53 @@ class SessionService:
                 message=f"Error generating response: {str(e)}",
                 model=model,
                 messages_count=len(conversation),
+            )
+
+    async def summarize_session(self, db: AsyncSession, session_id: int) -> str:
+        """Generate a summary of the full session"""
+        session = await self.get_session(db, session_id)
+        agent = await db.get(Agent, session.agent_id)
+        if not agent:
+            raise AgentNotFoundError(session.agent_id)
+
+        messages = await self.get_session_messages(db, session_id)
+
+        # Build conversation text to summarize
+        text = "\n".join([f"{msg.sender}: {msg.content}" for msg in messages])
+
+        prompt = (
+            "Summarize the following conversation between a user and an AI assistant:\n\n"
+            + text
+            + "\n\nSummary:"
+        )
+
+        try:
+            client = self.openai_client or openai.AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            model = (
+                agent.configuration.get("model", self.default_model)
+                if agent.configuration
+                else self.default_model
+            )
+
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant that summarizes conversations.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=300,
+                temperature=0.5,
+            )
+
+            content = response.choices[0].message.content
+            return content if content else "No summary generated."
+
+        except Exception as e:
+            raise OpenAIChatCompletionError(
+                message=f"Failed to summarize session: {str(e)}",
+                model=model,
+                messages_count=len(messages),
             )
